@@ -1,0 +1,6 @@
+.git
+.github
+*.db
+plugin/plugin.wasm
+plugin/*.ndp
+tmp

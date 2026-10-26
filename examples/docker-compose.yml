@@ -1,0 +1,46 @@
+# Example only. Service names matter: the companion must be called
+# `nd-simple-rpc` (the plugin's manifest allows that hostname).
+services:
+  nd-simple-rpc-plugin:
+    image: ghcr.io/laforcem/nd-simple-rpc:latest
+    command: ["install-plugin", "/data/plugins"]
+    user: "0:0" # the image runs as nonroot by default; the fresh volume is root-owned
+    volumes:
+      - navidrome-data:/data
+    restart: "no"
+
+  navidrome:
+    image: deluan/navidrome:latest
+    depends_on:
+      nd-simple-rpc-plugin:
+        condition: service_completed_successfully
+    environment:
+      ND_PLUGINS_ENABLED: "true"
+      ND_PLUGINS_AUTORELOAD: "true"
+      ND_BASEURL: https://music.${DOMAIN}
+    volumes:
+      - navidrome-data:/data
+      - ${MUSIC_DIR}:/music:ro
+    ports:
+      - "4533:4533"
+
+  nd-simple-rpc:
+    image: ghcr.io/laforcem/nd-simple-rpc:latest
+    environment:
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET}
+      PUBLIC_URL: https://presence.music.${DOMAIN}
+      NAVIDROME_URL: http://navidrome:4533
+      SHARED_SECRET: ${SHARED_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      SESSION_KEY: ${SESSION_KEY}
+      DB_PATH: /state/nd-simple-rpc.db
+    volumes:
+      - nd-simple-rpc-state:/state
+    ports:
+      - "8080:8080" # public: put your reverse proxy in front of this
+      # 8081 (internal) is deliberately not published.
+
+volumes:
+  navidrome-data:
+  nd-simple-rpc-state:

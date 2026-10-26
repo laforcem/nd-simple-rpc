@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/laforcem/nd-simple-rpc/internal/config"
 	"github.com/laforcem/nd-simple-rpc/internal/discord"
 	"github.com/laforcem/nd-simple-rpc/internal/engine"
+	"github.com/laforcem/nd-simple-rpc/internal/install"
 	"github.com/laforcem/nd-simple-rpc/internal/store"
 	"github.com/laforcem/nd-simple-rpc/internal/tokens"
 	"github.com/laforcem/nd-simple-rpc/internal/web"
@@ -24,7 +26,10 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = "usage: nd-simple-rpc [serve]\n"
+const (
+	usage      = "usage: nd-simple-rpc [serve | install-plugin [--src FILE] DIR]\n"
+	defaultSrc = "/plugin/nd-simple-rpc.ndp"
+)
 
 func main() {
 	discord.Version = version
@@ -40,10 +45,36 @@ func main() {
 			log.Error("fatal", "err", err)
 			os.Exit(1)
 		}
+	case "install-plugin":
+		if err := installPlugin(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "install-plugin:", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+}
+
+func installPlugin(args []string) error {
+	fs := flag.NewFlagSet("install-plugin", flag.ContinueOnError)
+	src := fs.String("src", defaultSrc, "plugin file to install")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("want exactly one destination directory")
+	}
+	changed, err := install.Plugin(*src, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Println("installed", install.FileName, "into", fs.Arg(0))
+	} else {
+		fmt.Println(install.FileName, "already up to date; nothing changed")
+	}
+	return nil
 }
 
 func serve(log *slog.Logger) error {
