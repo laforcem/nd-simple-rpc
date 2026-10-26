@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +69,10 @@ type server struct {
 }
 
 // NewPublic returns the handler for the public site.
-func NewPublic(d Deps) http.Handler {
+func NewPublic(d Deps) (http.Handler, error) {
+	if len(d.SessionKey) < 32 {
+		return nil, errors.New("web: SessionKey must be at least 32 bytes")
+	}
 	s := &server{Deps: d, failures: map[string][]time.Time{}}
 	// Derive a purpose-specific key so the raw SessionKey is never used directly.
 	k := sha256.Sum256(append([]byte("nd-simple-rpc/web/v1\x00"), d.SessionKey...))
@@ -87,7 +91,7 @@ func NewPublic(d Deps) http.Handler {
 	mux.HandleFunc("POST /resume", s.authPost(s.resume))
 	mux.HandleFunc("POST /disconnect", s.authPost(s.disconnect))
 	mux.HandleFunc("POST /logout", s.authPost(s.logout))
-	return noStore(mux)
+	return noStore(mux), nil
 }
 
 func noStore(h http.Handler) http.Handler {
@@ -131,6 +135,10 @@ func (s *server) auth(h handler) http.HandlerFunc {
 // authPost requires a session and a valid CSRF token.
 func (s *server) authPost(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.sameOrigin(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		user, sv, ok := s.currentUser(r)
 		if !ok {
 			http.Redirect(w, r, "/", http.StatusFound)
@@ -144,10 +152,27 @@ func (s *server) authPost(h handler) http.HandlerFunc {
 	}
 }
 
-func render(w http.ResponseWriter, status int, name string, data any) {
+func (s *server) render(w http.ResponseWriter, status int, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	_ = tmpl.ExecuteTemplate(w, name, data)
+	if err := tmpl.ExecuteTemplate(w, name, data); err != nil {
+		s.log.Error("render template", "template", name, "err", err)
+	}
+}
+
+// sameOrigin rejects cross-site POSTs: browsers send Sec-Fetch-Site and Origin
+// on them; non-browser clients that send neither are not a CSRF vector.
+func (s *server) sameOrigin(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		return false
+	}
+	if o := r.Header.Get("Origin"); o != "" {
+		pu, err := url.Parse(s.PublicURL)
+		if err != nil || o != pu.Scheme+"://"+pu.Host {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *server) setCookie(w http.ResponseWriter, name, value string, maxAge int) {
@@ -162,7 +187,7 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/settings", http.StatusFound)
 		return
 	}
-	render(w, http.StatusOK, "login.html", map[string]any{})
+	s.render(w, http.StatusOK, "login.html", map[string]any{})
 }
 
 // clientIP trusts X-Forwarded-For because the service only runs behind Traefik.
@@ -198,15 +223,38 @@ func (s *server) recent(ip string) []time.Time {
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
-	s.mu.Lock()
-	limited := len(s.recent(ip)) >= loginMaxFailures
-	s.mu.Unlock()
-	if limited {
-		render(w, http.StatusTooManyRequests, "login.html", map[string]any{"Error": "Too many failed attempts. Try again later."})
+	if !s.sameOrigin(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	ip := clientIP(r)
+	// Reserve a slot before calling Navidrome so concurrent requests cannot
+	// all slip under the limit. It is released unless the attempt fails on bad credentials.
+	s.mu.Lock()
+	if len(s.recent(ip)) >= loginMaxFailures {
+		s.mu.Unlock()
+		s.render(w, http.StatusTooManyRequests, "login.html", map[string]any{"Error": "Too many failed attempts. Try again later."})
+		return
+	}
+	reserved := s.now()
+	s.failures[ip] = append(s.failures[ip], reserved)
+	s.mu.Unlock()
+	release := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		f := s.failures[ip]
+		for i := len(f) - 1; i >= 0; i-- {
+			if f[i].Equal(reserved) {
+				s.failures[ip] = append(f[:i], f[i+1:]...)
+				break
+			}
+		}
+		if len(s.failures[ip]) == 0 {
+			delete(s.failures, ip)
+		}
+	}
 	if err := r.ParseForm(); err != nil {
+		release()
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -214,17 +262,15 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	canonical, err := navidrome.Login(r.Context(), s.NavidromeURL, user, pass)
 	switch {
 	case errors.Is(err, navidrome.ErrBadCredentials):
-		s.mu.Lock()
-		s.recent(ip)
-		s.failures[ip] = append(s.failures[ip], s.now())
-		s.mu.Unlock()
-		render(w, http.StatusOK, "login.html", map[string]any{"Error": "Invalid username or password."})
+		s.render(w, http.StatusOK, "login.html", map[string]any{"Error": "Invalid username or password."})
 		return
 	case err != nil:
+		release()
 		s.log.Error("navidrome login failed", "err", err)
-		render(w, http.StatusBadGateway, "login.html", map[string]any{"Error": "Could not reach Navidrome. Try again later."})
+		s.render(w, http.StatusBadGateway, "login.html", map[string]any{"Error": "Could not reach Navidrome. Try again later."})
 		return
 	}
+	release()
 	s.setCookie(w, sessionCookie, s.sessionValue(canonical), int(sessionTTL/time.Second))
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
@@ -237,7 +283,7 @@ func (s *server) settings(w http.ResponseWriter, r *http.Request, user string) {
 		return
 	}
 	c, _ := r.Cookie(sessionCookie)
-	render(w, http.StatusOK, "settings.html", map[string]any{
+	s.render(w, http.StatusOK, "settings.html", map[string]any{
 		"Username":        user,
 		"Connected":       u.DiscordUserID != "" && !u.NeedsReconnect,
 		"NeedsReconnect":  u.NeedsReconnect,
@@ -255,7 +301,7 @@ func randomString(n int) (string, error) {
 	return b64.EncodeToString(b), nil
 }
 
-func (s *server) connect(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *server) connect(w http.ResponseWriter, r *http.Request, user string) {
 	state, err1 := randomString(16)
 	verifier, err2 := randomString(32)
 	if err1 != nil || err2 != nil {
@@ -263,7 +309,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	sum := sha256.Sum256([]byte(verifier))
-	s.setCookie(w, oauthCookie, s.oauthValue(state, verifier), int(oauthTTL/time.Second))
+	s.setCookie(w, oauthCookie, s.oauthValue(state, verifier, user), int(oauthTTL/time.Second))
 	http.Redirect(w, r, s.Discord.AuthorizeURL(state, b64.EncodeToString(sum[:])), http.StatusFound)
 }
 
@@ -273,9 +319,9 @@ func (s *server) callback(w http.ResponseWriter, r *http.Request, user string) {
 		http.Error(w, "missing or expired authorization state", http.StatusBadRequest)
 		return
 	}
-	state, verifier, ok := s.oauthParts(c.Value)
+	state, verifier, boundUser, ok := s.oauthParts(c.Value)
 	got := r.URL.Query().Get("state")
-	if !ok || subtle.ConstantTimeCompare([]byte(state), []byte(got)) != 1 {
+	if !ok || boundUser != user || subtle.ConstantTimeCompare([]byte(state), []byte(got)) != 1 {
 		http.Error(w, "invalid authorization state", http.StatusBadRequest)
 		return
 	}

@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	sessionCookie = "nsr_session"
-	oauthCookie   = "nsr_oauth"
+	sessionCookie = "__Host-nsr_session"
+	oauthCookie   = "__Host-nsr_oauth"
 	sessionTTL    = 30 * 24 * time.Hour
 	oauthTTL      = 10 * time.Minute
 )
@@ -76,16 +76,23 @@ func (s *server) csrfOK(sessionValue, token string) bool {
 	return hmac.Equal([]byte(token), []byte(s.csrf(sessionValue)))
 }
 
-func (s *server) oauthValue(state, verifier string) string {
-	return s.sign("oauth", state+"~"+verifier, oauthTTL)
+func (s *server) oauthValue(state, verifier, user string) string {
+	return s.sign("oauth", state+"~"+verifier+"~"+b64.EncodeToString([]byte(user)), oauthTTL)
 }
 
-// state and verifier are base64url, which never contains '~'.
-func (s *server) oauthParts(value string) (state, verifier string, ok bool) {
+// state, verifier and the encoded user are base64url, which never contains '~'.
+func (s *server) oauthParts(value string) (state, verifier, user string, ok bool) {
 	p, ok := s.verify("oauth", value)
 	if !ok {
-		return "", "", false
+		return "", "", "", false
 	}
-	state, verifier, ok = strings.Cut(p, "~")
-	return state, verifier, ok && state != "" && verifier != ""
+	parts := strings.Split(p, "~")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return "", "", "", false
+	}
+	u, err := b64.DecodeString(parts[2])
+	if err != nil || len(u) == 0 {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], string(u), true
 }

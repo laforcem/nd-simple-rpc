@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +82,7 @@ type env struct {
 	logs   *bytes.Buffer
 	dbPath string
 	events []string
+	ndHits atomic.Int32
 }
 
 func newEnv(t *testing.T, ndUser string) *env {
@@ -89,6 +91,10 @@ func newEnv(t *testing.T, ndUser string) *env {
 	e.nd = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Username, Password string }
 		_ = decodeJSON(r, &body)
+		e.ndHits.Add(1)
+		if body.Password == "bad" {
+			time.Sleep(20 * time.Millisecond)
+		}
 		if body.Password != "good" {
 			w.WriteHeader(401)
 			return
@@ -109,12 +115,16 @@ func newEnv(t *testing.T, ndUser string) *env {
 		events:   &e.events,
 	}
 	e.eng = &fakeEngine{events: &e.events, st: st}
-	e.h = NewPublic(Deps{
+	h, err := NewPublic(Deps{
 		Store: st, Discord: e.dc, Engine: e.eng,
 		NavidromeURL: e.nd.URL, PublicURL: "https://presence.example",
 		SessionKey: bytes.Repeat([]byte{9}, 32),
 		Log:        slog.New(slog.NewTextHandler(e.logs, nil)),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h = h
 	return e
 }
 
@@ -155,7 +165,7 @@ func (e *env) login(t *testing.T, typed string) *http.Cookie {
 	if w.Code != 303 && w.Code != 302 {
 		t.Fatalf("login status %d: %s", w.Code, w.Body)
 	}
-	c := cookie(w, "nsr_session")
+	c := cookie(w, "__Host-nsr_session")
 	if c == nil {
 		t.Fatal("no session cookie")
 	}
@@ -187,7 +197,7 @@ func TestLoginCanonicalUsername(t *testing.T) {
 	}
 	// connect + callback stores under Malc
 	cw := e.do("GET", "/connect", nil, []*http.Cookie{sess}, nil)
-	oauth := cookie(cw, "nsr_oauth")
+	oauth := cookie(cw, "__Host-nsr_oauth")
 	state := url.QueryEscape("")
 	loc, _ := url.Parse(cw.Header().Get("Location"))
 	state = loc.Query().Get("state")
@@ -209,7 +219,7 @@ func TestLoginBadPassword(t *testing.T) {
 	if w.Code != 200 && w.Code != 401 {
 		t.Fatalf("status %d", w.Code)
 	}
-	if cookie(w, "nsr_session") != nil {
+	if cookie(w, "__Host-nsr_session") != nil {
 		t.Fatal("cookie set")
 	}
 	if !strings.Contains(w.Body.String(), "Invalid") {
@@ -241,7 +251,7 @@ func TestLoginNavidromeDownIsErrorPage(t *testing.T) {
 	e := newEnv(t, "Malc")
 	e.nd.Close()
 	w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"good"}}, nil, nil)
-	if w.Code != 502 || cookie(w, "nsr_session") != nil {
+	if w.Code != 502 || cookie(w, "__Host-nsr_session") != nil {
 		t.Fatalf("status %d", w.Code)
 	}
 }
@@ -293,7 +303,7 @@ func TestConnectRedirect(t *testing.T) {
 	if loc.Query().Get("state") == "" || loc.Query().Get("code_challenge") == "" || loc.Query().Get("code_challenge_method") != "S256" {
 		t.Fatalf("loc %s", loc)
 	}
-	c := cookie(w, "nsr_oauth")
+	c := cookie(w, "__Host-nsr_oauth")
 	if c == nil || !c.Secure || !c.HttpOnly || c.MaxAge != 600 {
 		t.Fatalf("oauth cookie %+v", c)
 	}
@@ -313,7 +323,7 @@ func TestCallbackStateMismatch(t *testing.T) {
 	e := newEnv(t, "Malc")
 	sess := e.login(t, "malc")
 	cw := e.do("GET", "/connect", nil, []*http.Cookie{sess}, nil)
-	oauth := cookie(cw, "nsr_oauth")
+	oauth := cookie(cw, "__Host-nsr_oauth")
 	w := e.do("GET", "/callback?code=abc&state=wrong", nil, []*http.Cookie{sess, oauth}, nil)
 	if w.Code != 400 {
 		t.Fatalf("%d", w.Code)
@@ -334,7 +344,7 @@ func connected(t *testing.T, e *env) (*http.Cookie, string) {
 	cw := e.do("GET", "/connect", nil, []*http.Cookie{sess}, nil)
 	loc, _ := url.Parse(cw.Header().Get("Location"))
 	e.do("GET", "/callback?code=abc&state="+url.QueryEscape(loc.Query().Get("state")), nil,
-		[]*http.Cookie{sess, cookie(cw, "nsr_oauth")}, nil)
+		[]*http.Cookie{sess, cookie(cw, "__Host-nsr_oauth")}, nil)
 	return sess, e.csrfFor(t, sess)
 }
 
@@ -445,7 +455,7 @@ func TestLogout(t *testing.T) {
 	e := newEnv(t, "Malc")
 	sess, csrf := connected(t, e)
 	w := e.do("POST", "/logout", url.Values{"csrf": {csrf}}, []*http.Cookie{sess}, nil)
-	c := cookie(w, "nsr_session")
+	c := cookie(w, "__Host-nsr_session")
 	if c == nil || c.MaxAge >= 0 {
 		t.Fatalf("%+v", c)
 	}
@@ -476,3 +486,95 @@ func TestSettingsConnectedAndPausedLabels(t *testing.T) {
 }
 
 func decodeJSON(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+
+func TestNewPublicRejectsShortKey(t *testing.T) {
+	h, err := NewPublic(Deps{SessionKey: make([]byte, 31)})
+	if err == nil || h != nil {
+		t.Fatalf("got %v, %v", h, err)
+	}
+}
+
+func TestLoginCSRFHeaders(t *testing.T) {
+	e := newEnv(t, "Malc")
+	form := url.Values{"username": {"malc"}, "password": {"good"}}
+	cases := []struct {
+		name string
+		hdr  map[string]string
+		want int
+	}{
+		{"cross-site", map[string]string{"Sec-Fetch-Site": "cross-site"}, 403},
+		{"foreign origin", map[string]string{"Origin": "https://evil.example"}, 403},
+		{"null origin", map[string]string{"Origin": "null"}, 403},
+		{"same origin", map[string]string{"Origin": "https://presence.example", "Sec-Fetch-Site": "same-origin"}, 303},
+		{"no headers", nil, 303},
+	}
+	for _, c := range cases {
+		w := e.do("POST", "/login", form, nil, c.hdr)
+		if w.Code != c.want {
+			t.Errorf("%s: %d want %d", c.name, w.Code, c.want)
+		}
+		if c.want == 403 && cookie(w, "__Host-nsr_session") != nil {
+			t.Errorf("%s: cookie set", c.name)
+		}
+	}
+	// also enforced on authenticated POSTs
+	sess, csrf := connected(t, e)
+	w := e.do("POST", "/pause", url.Values{"csrf": {csrf}}, []*http.Cookie{sess}, map[string]string{"Sec-Fetch-Site": "cross-site"})
+	if w.Code != 403 {
+		t.Errorf("pause cross-site: %d", w.Code)
+	}
+}
+
+func TestCallbackRejectsDifferentSessionUser(t *testing.T) {
+	e := newEnv(t, "Alice")
+	sessA := e.login(t, "alice")
+	cw := e.do("GET", "/connect", nil, []*http.Cookie{sessA}, nil)
+	loc, _ := url.Parse(cw.Header().Get("Location"))
+	// switch to a different user's session
+	e.nd.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"username":"Bob"}`)) })
+	sessB := e.login(t, "bob")
+	w := e.do("GET", "/callback?code=abc&state="+url.QueryEscape(loc.Query().Get("state")), nil,
+		[]*http.Cookie{sessB, cookie(cw, "__Host-nsr_oauth")}, nil)
+	if w.Code != 400 {
+		t.Fatalf("%d", w.Code)
+	}
+	for _, n := range []string{"Alice", "Bob"} {
+		if _, ok, _ := e.st.Get(context.Background(), n); ok {
+			t.Fatalf("%s stored", n)
+		}
+	}
+}
+
+func TestLoginReservesSlotBeforeNavidrome(t *testing.T) {
+	e := newEnv(t, "Malc")
+	hdr := map[string]string{"X-Forwarded-For": "9.9.9.9"}
+	var wg sync.WaitGroup
+	var limited atomic.Int32
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"bad"}}, nil, hdr)
+			if w.Code == 429 {
+				limited.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := e.ndHits.Load(); n > 5 {
+		t.Fatalf("%d requests reached Navidrome", n)
+	}
+	if limited.Load() != 5 {
+		t.Fatalf("limited = %d", limited.Load())
+	}
+}
+
+func TestSuccessfulLoginReleasesSlot(t *testing.T) {
+	e := newEnv(t, "Malc")
+	hdr := map[string]string{"X-Forwarded-For": "8.8.8.8"}
+	for i := 0; i < 20; i++ {
+		if w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"good"}}, nil, hdr); w.Code == 429 {
+			t.Fatalf("limited at %d", i)
+		}
+	}
+}
