@@ -179,7 +179,7 @@ func TestInstallStampedIdempotent(t *testing.T) {
 func TestInstallRejectsBadConnectURL(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "src.ndp")
 	writeNDP(t, src, map[string]any{"name": "nd-simple-rpc"})
-	for _, u := range []string{"presence.example.com", "ftp://x.example.com", "https://", "javascript:alert(1)"} {
+	for _, u := range []string{"presence.example.com", "ftp://x.example.com", "https://", "javascript:alert(1)", "https://u:p@presence.example.com"} {
 		if _, err := Plugin(src, t.TempDir(), u); err == nil {
 			t.Errorf("%q: want error", u)
 		}

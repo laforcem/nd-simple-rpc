@@ -71,7 +71,7 @@ func Plugin(src, dstDir, connectURL string) (changed bool, err error) {
 
 func validURL(s string) error {
 	u, err := url.Parse(s)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
 		return errors.New("connect URL must be an absolute http(s) URL")
 	}
 	return nil
@@ -100,16 +100,20 @@ func stampWebsite(ndp []byte, website string) ([]byte, error) {
 		}
 		if f.Name == "manifest.json" {
 			found = true
-			var m map[string]any
+			// RawMessage keeps every other field byte-for-byte.
+			var m map[string]json.RawMessage
 			if err := json.Unmarshal(body, &m); err != nil {
 				return nil, fmt.Errorf("parse manifest: %w", err)
 			}
-			m["website"] = website
+			if m["website"], err = json.Marshal(website); err != nil {
+				return nil, err
+			}
 			if body, err = json.MarshalIndent(m, "", "  "); err != nil {
 				return nil, err
 			}
 		}
 		h := f.FileHeader
+		h.Extra = nil // CreateHeader writes its own timestamp extra
 		w, err := zw.CreateHeader(&h)
 		if err != nil {
 			return nil, err
@@ -117,6 +121,9 @@ func stampWebsite(ndp []byte, website string) ([]byte, error) {
 		if _, err := w.Write(body); err != nil {
 			return nil, err
 		}
+	}
+	if err := zw.SetComment(zr.Comment); err != nil {
+		return nil, err
 	}
 	if !found {
 		return nil, errors.New("manifest.json not found in plugin")

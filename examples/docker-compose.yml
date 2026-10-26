@@ -3,7 +3,7 @@
 services:
   nd-simple-rpc-plugin:
     image: ghcr.io/laforcem/nd-simple-rpc:latest
-    command: ["install-plugin", "--connect-url", "https://presence.music.${DOMAIN}", "/data/plugins"]
+    command: ["install-plugin", "--connect-url", "https://presence.music.${DOMAIN:?set DOMAIN}", "/data/plugins"]
     user: "0:0" # the image runs as nonroot by default; the fresh volume is root-owned
     volumes:
       - navidrome-data:/data
