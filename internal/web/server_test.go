@@ -555,31 +555,52 @@ func TestNewPublicRejectsShortKey(t *testing.T) {
 func TestLoginCSRFHeaders(t *testing.T) {
 	e := newEnv(t, "Malc")
 	form := url.Values{"username": {"malc"}, "password": {"good"}}
+	const pub = "https://presence.example"
 	cases := []struct {
-		name string
-		hdr  map[string]string
-		want int
+		name    string
+		hdr     map[string]string
+		allowed bool
 	}{
-		{"cross-site", map[string]string{"Sec-Fetch-Site": "cross-site"}, 403},
-		{"foreign origin", map[string]string{"Origin": "https://evil.example"}, 403},
-		{"null origin", map[string]string{"Origin": "null"}, 403},
-		{"same origin", map[string]string{"Origin": "https://presence.example", "Sec-Fetch-Site": "same-origin"}, 303},
-		{"no headers", nil, 303},
+		{"cross-site", map[string]string{"Sec-Fetch-Site": "cross-site"}, false},
+		{"same-site", map[string]string{"Sec-Fetch-Site": "same-site"}, false},
+		{"same-site matching origin", map[string]string{"Sec-Fetch-Site": "same-site", "Origin": pub}, false},
+		{"same-origin null origin (no-referrer browsers)", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "null"}, true},
+		{"same-origin", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": pub}, true},
+		{"none", map[string]string{"Sec-Fetch-Site": "none"}, true},
+		{"no fetch-site, matching origin", map[string]string{"Origin": pub}, true},
+		{"no fetch-site, foreign origin", map[string]string{"Origin": "https://evil.example"}, false},
+		{"no fetch-site, null origin", map[string]string{"Origin": "null"}, false},
+		{"no headers", nil, true},
 	}
 	for _, c := range cases {
 		w := e.do("POST", "/login", form, nil, c.hdr)
-		if w.Code != c.want {
-			t.Errorf("%s: %d want %d", c.name, w.Code, c.want)
+		if c.allowed && w.Code != 303 {
+			t.Errorf("login %s: %d want 303", c.name, w.Code)
 		}
-		if c.want == 403 && cookie(w, "__Host-nsr_session") != nil {
-			t.Errorf("%s: cookie set", c.name)
+		if !c.allowed {
+			if w.Code != 403 {
+				t.Errorf("login %s: %d want 403", c.name, w.Code)
+			}
+			if cookie(w, "__Host-nsr_session") != nil {
+				t.Errorf("login %s: cookie set", c.name)
+			}
 		}
 	}
-	// also enforced on authenticated POSTs
+	// same semantics on authenticated POSTs
 	sess, csrf := connected(t, e)
-	w := e.do("POST", "/pause", url.Values{"csrf": {csrf}}, []*http.Cookie{sess}, map[string]string{"Sec-Fetch-Site": "cross-site"})
-	if w.Code != 403 {
-		t.Errorf("pause cross-site: %d", w.Code)
+	for _, c := range cases {
+		w := e.do("POST", "/pause", url.Values{"csrf": {csrf}}, []*http.Cookie{sess}, c.hdr)
+		if got := w.Code != 403; got != c.allowed {
+			t.Errorf("pause %s: code %d, allowed=%v want %v", c.name, w.Code, got, c.allowed)
+		}
+	}
+}
+
+func TestReferrerPolicyHeader(t *testing.T) {
+	e := newEnv(t, "Malc")
+	w := e.do("GET", "/", nil, nil, nil)
+	if got := w.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Errorf("Referrer-Policy = %q, want same-origin", got)
 	}
 }
 

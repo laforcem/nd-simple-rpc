@@ -106,7 +106,7 @@ func noStore(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Referrer-Policy", "same-origin")
 		h.ServeHTTP(w, r)
 	})
 }
@@ -168,11 +168,13 @@ func (s *server) render(w http.ResponseWriter, status int, name string, data any
 	}
 }
 
-// sameOrigin rejects cross-site POSTs: browsers send Sec-Fetch-Site and Origin
-// on them; non-browser clients that send neither are not a CSRF vector.
+// sameOrigin rejects cross-site POSTs. Sec-Fetch-Site is set by the browser and
+// cannot be forged by page script, so when present it is authoritative (Origin
+// may legitimately be "null" under some referrer policies). Without it, fall
+// back to Origin; non-browser clients that send neither are not a CSRF vector.
 func (s *server) sameOrigin(r *http.Request) bool {
-	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
-		return false
+	if sf := r.Header.Get("Sec-Fetch-Site"); sf != "" {
+		return sf == "same-origin" || sf == "none"
 	}
 	if o := r.Header.Get("Origin"); o != "" {
 		pu, err := url.Parse(s.PublicURL)
