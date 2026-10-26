@@ -112,6 +112,8 @@ func serve(log *slog.Logger) error {
 		PublicURL:    cfg.PublicURL,
 		SessionKey:   cfg.SessionKey,
 		Log:          log,
+
+		TrustedProxyHops: cfg.TrustedProxyHops,
 	})
 	if err != nil {
 		return err

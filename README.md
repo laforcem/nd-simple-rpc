@@ -37,6 +37,7 @@ Every deployer brings their own Discord application.
 | `DB_PATH` | yes | SQLite file path, on a persistent volume |
 | `PUBLIC_ADDR` | no | Public listen address. Default `:8080` |
 | `INTERNAL_ADDR` | no | Internal listen address. Default `:8081` |
+| `TRUSTED_PROXY_HOPS` | no | Number of reverse proxies in front of the public port that append to `X-Forwarded-For` (0-5). The login rate limit keys on the entry this many places from the right; `0` ignores the header. Default `1`; behind Traefik use `1` |
 
 Generate keys with `openssl rand -base64 32`.
 

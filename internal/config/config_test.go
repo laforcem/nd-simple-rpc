@@ -85,3 +85,22 @@ func TestConfigPublicURL(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigTrustedProxyHops(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil || c.TrustedProxyHops != 1 {
+		t.Fatalf("default: %d, %v", c.TrustedProxyHops, err)
+	}
+	for in, want := range map[string]int{"0": 0, "2": 2, "5": 5} {
+		c, err := Load(env(map[string]string{"TRUSTED_PROXY_HOPS": in}))
+		if err != nil || c.TrustedProxyHops != want {
+			t.Errorf("%q: %d, %v", in, c.TrustedProxyHops, err)
+		}
+	}
+	for _, in := range []string{"-1", "6", "one", "1.5"} {
+		_, err := Load(env(map[string]string{"TRUSTED_PROXY_HOPS": in}))
+		if err == nil || !strings.Contains(err.Error(), "TRUSTED_PROXY_HOPS") {
+			t.Errorf("%q: err = %v", in, err)
+		}
+	}
+}

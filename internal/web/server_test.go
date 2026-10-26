@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,7 @@ type fakeEngine struct {
 	events        *[]string
 	st            *store.Store
 	pausedAtClear []bool
+	onClear       func()
 }
 
 func (f *fakeEngine) Clear(ctx context.Context, u string) error {
@@ -69,6 +71,9 @@ func (f *fakeEngine) Clear(ctx context.Context, u string) error {
 	if f.st != nil {
 		usr, _, _ := f.st.Get(ctx, u)
 		f.pausedAtClear = append(f.pausedAtClear, usr.Paused)
+	}
+	if f.onClear != nil {
+		f.onClear()
 	}
 	return f.err
 }
@@ -118,8 +123,9 @@ func newEnv(t *testing.T, ndUser string) *env {
 	h, err := NewPublic(Deps{
 		Store: st, Discord: e.dc, Engine: e.eng,
 		NavidromeURL: e.nd.URL, PublicURL: "https://presence.example",
-		SessionKey: bytes.Repeat([]byte{9}, 32),
-		Log:        slog.New(slog.NewTextHandler(e.logs, nil)),
+		SessionKey:       bytes.Repeat([]byte{9}, 32),
+		TrustedProxyHops: 1,
+		Log:              slog.New(slog.NewTextHandler(e.logs, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -350,16 +356,46 @@ func connected(t *testing.T, e *env) (*http.Cookie, string) {
 
 func TestCallbackStoresTokens(t *testing.T) {
 	e := newEnv(t, "Malc")
-	// pre-existing flagged row is replaced wholesale
+	// a pre-existing flagged row is replaced, except its Paused flag
 	e.st.Put(context.Background(), store.User{Username: "Malc", NeedsReconnect: true, Paused: true})
 	connected(t, e)
 	u, ok, _ := e.st.Get(context.Background(), "Malc")
 	if !ok || u.DiscordUserID != "d1" || u.DiscordUsername != "discordname" ||
-		u.RefreshToken != "rt" || u.AccessToken != "at" || u.NeedsReconnect || u.Paused || u.SessionToken != "" {
+		u.RefreshToken != "rt" || u.AccessToken != "at" || u.NeedsReconnect || !u.Paused || u.SessionToken != "" {
 		t.Fatalf("%+v", u)
 	}
 	if u.AccessExpiresAt.IsZero() {
 		t.Error("no expiry")
+	}
+	if len(e.dc.revoked) != 0 {
+		t.Errorf("revoked %v; the old row had no refresh token", e.dc.revoked)
+	}
+}
+
+func TestCallbackRevokesReplacedRefreshToken(t *testing.T) {
+	e := newEnv(t, "Malc")
+	e.st.Put(context.Background(), store.User{Username: "Malc", DiscordUserID: "d0", RefreshToken: "rt-old", AccessToken: "at-old"})
+	connected(t, e)
+	if len(e.dc.revoked) != 1 || e.dc.revoked[0] != "rt-old" {
+		t.Fatalf("revoked %v, want [rt-old]", e.dc.revoked)
+	}
+	u, _, _ := e.st.Get(context.Background(), "Malc")
+	if u.RefreshToken != "rt" || u.Paused {
+		t.Fatalf("%+v", u)
+	}
+	if strings.Contains(e.logs.String(), "rt-old") {
+		t.Fatal("token in logs")
+	}
+	// Reconnecting the same Discord account revokes nothing: Discord's
+	// revoke would invalidate the new tokens as well.
+	e.st.SetTokens(context.Background(), "Malc", "at-old", "rt-old", time.Now().Add(time.Hour))
+	e.dc.revoked = nil
+	connected(t, e)
+	if len(e.dc.revoked) != 0 {
+		t.Fatalf("revoked %v, want none", e.dc.revoked)
+	}
+	if u, _, _ := e.st.Get(context.Background(), "Malc"); u.RefreshToken != "rt" {
+		t.Fatalf("%+v", u)
 	}
 }
 
@@ -413,6 +449,28 @@ func TestDisconnect(t *testing.T) {
 		t.Fatalf("%d", w.Code)
 	}
 	if strings.Join(e.events, ",") != "clear,revoke:rt" {
+		t.Fatalf("events %v", e.events)
+	}
+	if len(e.eng.pausedAtClear) != 1 || !e.eng.pausedAtClear[0] {
+		t.Fatal("Paused must be set before Clear")
+	}
+	if _, ok, _ := e.st.Get(context.Background(), "Malc"); ok {
+		t.Fatal("row remains")
+	}
+}
+
+func TestDisconnectRevokesPostClearToken(t *testing.T) {
+	e := newEnv(t, "Malc")
+	sess, csrf := connected(t, e)
+	// A refresh during Clear rotates the stored refresh token.
+	e.eng.onClear = func() {
+		if err := e.st.SetTokens(context.Background(), "Malc", "at2", "rt-rotated", time.Now().Add(time.Hour)); err != nil {
+			t.Error(err)
+		}
+	}
+	e.events = nil
+	e.do("POST", "/disconnect", url.Values{"csrf": {csrf}}, []*http.Cookie{sess}, nil)
+	if strings.Join(e.events, ",") != "clear,revoke:rt-rotated" {
 		t.Fatalf("events %v", e.events)
 	}
 	if _, ok, _ := e.st.Get(context.Background(), "Malc"); ok {
@@ -576,5 +634,75 @@ func TestSuccessfulLoginReleasesSlot(t *testing.T) {
 		if w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"good"}}, nil, hdr); w.Code == 429 {
 			t.Fatalf("limited at %d", i)
 		}
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	cases := []struct {
+		xff  string
+		hops int
+		want string
+	}{
+		{"", 1, "192.0.2.1"},
+		{"1.1.1.1", 0, "192.0.2.1"},
+		{"1.1.1.1", 1, "1.1.1.1"},
+		{"6.6.6.6, 1.1.1.1", 1, "1.1.1.1"},
+		{"6.6.6.6, 1.1.1.1, 10.0.0.2", 2, "1.1.1.1"},
+		{"1.1.1.1", 2, "192.0.2.1"},
+		{" 6.6.6.6 ,  1.1.1.1 ", 1, "1.1.1.1"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("POST", "/login", nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		if c.xff != "" {
+			r.Header.Set("X-Forwarded-For", c.xff)
+		}
+		if got := clientIP(r, c.hops); got != c.want {
+			t.Errorf("xff=%q hops=%d: %q, want %q", c.xff, c.hops, got, c.want)
+		}
+	}
+}
+
+func TestLoginRateLimitIgnoresSpoofedLeftmost(t *testing.T) {
+	e := newEnv(t, "Malc")
+	for i := 0; i < 5; i++ {
+		hdr := map[string]string{"X-Forwarded-For": fmt.Sprintf("10.9.9.%d, 1.2.3.4", i)}
+		e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"bad"}}, nil, hdr)
+	}
+	w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"good"}}, nil,
+		map[string]string{"X-Forwarded-For": "10.9.9.99, 1.2.3.4"})
+	if w.Code != 429 {
+		t.Fatalf("status %d, want 429", w.Code)
+	}
+}
+
+func TestFailureMapBounded(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	s := &server{failures: map[string][]time.Time{}, Deps: Deps{Now: func() time.Time { return now }}}
+	// Stale entries are swept once the map passes 1024 keys.
+	old := now.Add(-loginWindow - time.Second)
+	for i := 0; i < 1100; i++ {
+		s.addFailure(fmt.Sprintf("old-%d", i), old)
+	}
+	s.addFailure("fresh", now)
+	if n := len(s.failures); n > 1025 {
+		t.Fatalf("map holds %d keys after sweep", n)
+	}
+	if _, ok := s.failures["fresh"]; !ok {
+		t.Fatal("fresh entry missing")
+	}
+	// Fresh entries are hard-capped at 10000, dropping the oldest.
+	s.failures = map[string][]time.Time{}
+	for i := 0; i < 10050; i++ {
+		s.addFailure(fmt.Sprintf("ip-%d", i), now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if n := len(s.failures); n != 10000 {
+		t.Fatalf("map holds %d keys, want 10000", n)
+	}
+	if _, ok := s.failures["ip-0"]; ok {
+		t.Fatal("oldest entry kept")
+	}
+	if _, ok := s.failures["ip-10049"]; !ok {
+		t.Fatal("newest entry dropped")
 	}
 }

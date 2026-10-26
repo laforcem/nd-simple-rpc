@@ -50,13 +50,18 @@ type Deps struct {
 	NavidromeURL string
 	PublicURL    string // public base URL of this service (the OAuth redirect URI is configured on the Discord client)
 	SessionKey   []byte
-	Now          func() time.Time // nil uses time.Now
-	Log          *slog.Logger     // nil uses slog.Default()
+	// TrustedProxyHops is how many reverse proxies append to
+	// X-Forwarded-For; 0 ignores the header and uses the peer address.
+	TrustedProxyHops int
+	Now              func() time.Time // nil uses time.Now
+	Log              *slog.Logger     // nil uses slog.Default()
 }
 
 const (
 	loginMaxFailures = 5
 	loginWindow      = 15 * time.Minute
+	failuresSweepAt  = 1024  // sweep stale entries on insert above this many keys
+	failuresMaxKeys  = 10000 // hard cap; the oldest entry is dropped
 )
 
 type server struct {
@@ -66,6 +71,9 @@ type server struct {
 
 	mu       sync.Mutex
 	failures map[string][]time.Time
+	// floor is at or before every key's latest failure; a sweep can only
+	// remove something once it falls outside the window.
+	floor time.Time
 }
 
 // NewPublic returns the handler for the public site.
@@ -190,12 +198,20 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "login.html", map[string]any{})
 }
 
-// clientIP trusts X-Forwarded-For because the service only runs behind Traefik.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first, _, _ := strings.Cut(xff, ",")
-		if ip := strings.TrimSpace(first); ip != "" {
-			return ip
+// clientIP returns the X-Forwarded-For entry hops from the right: each
+// trusted proxy appends the address it saw, so entries left of that are
+// client-supplied and untrusted. With hops 0, or fewer entries than hops,
+// it uses the peer address.
+func clientIP(r *http.Request, hops int) string {
+	if hops > 0 {
+		var parts []string
+		for _, h := range r.Header.Values("X-Forwarded-For") {
+			parts = append(parts, strings.Split(h, ",")...)
+		}
+		if len(parts) >= hops {
+			if ip := strings.TrimSpace(parts[len(parts)-hops]); ip != "" {
+				return ip
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -222,12 +238,44 @@ func (s *server) recent(ip string) []time.Time {
 	return kept
 }
 
+// addFailure records a failed (or reserved) attempt for ip, bounding the
+// map: above failuresSweepAt keys it first drops entries with nothing in
+// the window, and at failuresMaxKeys it drops the key whose latest attempt
+// is oldest. Caller holds mu.
+func (s *server) addFailure(ip string, t time.Time) {
+	if _, ok := s.failures[ip]; !ok {
+		if len(s.failures) > failuresSweepAt && !s.floor.After(s.now().Add(-loginWindow)) {
+			floor := t
+			for k := range s.failures {
+				if kept := s.recent(k); len(kept) > 0 && kept[len(kept)-1].Before(floor) {
+					floor = kept[len(kept)-1]
+				}
+			}
+			s.floor = floor
+		}
+		if len(s.failures) >= failuresMaxKeys {
+			var oldestKey string
+			var oldest time.Time
+			for k, v := range s.failures {
+				if last := v[len(v)-1]; oldestKey == "" || last.Before(oldest) {
+					oldestKey, oldest = k, last
+				}
+			}
+			delete(s.failures, oldestKey)
+		}
+	}
+	if len(s.failures) == 0 || t.Before(s.floor) {
+		s.floor = t
+	}
+	s.failures[ip] = append(s.failures[ip], t)
+}
+
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	if !s.sameOrigin(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	ip := clientIP(r)
+	ip := clientIP(r, s.TrustedProxyHops)
 	// Reserve a slot before calling Navidrome so concurrent requests cannot
 	// all slip under the limit. It is released unless the attempt fails on bad credentials.
 	s.mu.Lock()
@@ -237,7 +285,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reserved := s.now()
-	s.failures[ip] = append(s.failures[ip], reserved)
+	s.addFailure(ip, reserved)
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
@@ -343,9 +391,24 @@ func (s *server) callback(w http.ResponseWriter, r *http.Request, user string) {
 		http.Error(w, "could not complete Discord authorization", http.StatusBadGateway)
 		return
 	}
+	old, _, err := s.Store.Get(r.Context(), user)
+	if err != nil {
+		s.log.Error("callback: store get", "user", user, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Best effort: a replaced grant for another Discord account would
+	// otherwise stay valid. Not for the same account: Discord's revoke
+	// invalidates every token the app holds for that user, the new ones too.
+	if old.RefreshToken != "" && old.RefreshToken != ts.RefreshToken && old.DiscordUserID != du.ID {
+		if err := s.Discord.Revoke(r.Context(), old.RefreshToken); err != nil {
+			s.log.Warn("callback: revoke replaced grant", "user", user, "err", err)
+		}
+	}
 	if err := s.Store.Put(r.Context(), store.User{
 		Username: user, DiscordUserID: du.ID, DiscordUsername: du.Username,
 		RefreshToken: ts.RefreshToken, AccessToken: ts.AccessToken, AccessExpiresAt: ts.ExpiresAt,
+		Paused: old.Paused,
 	}); err != nil {
 		s.log.Error("callback: store put", "user", user, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -377,14 +440,21 @@ func (s *server) resume(w http.ResponseWriter, r *http.Request, user string) {
 }
 
 func (s *server) disconnect(w http.ResponseWriter, r *http.Request, user string) {
-	u, _, err := s.Store.Get(r.Context(), user)
-	if err != nil {
-		s.log.Error("disconnect: store get", "user", user, "err", err)
+	// Pause first so the reconciler cannot re-post after Clear, and read the
+	// row after Clear: a refresh during Clear rotates the refresh token.
+	if err := s.Store.SetPaused(r.Context(), user, true); err != nil {
+		s.log.Error("disconnect: set paused", "user", user, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if err := s.Engine.Clear(r.Context(), user); err != nil && !errors.Is(err, tokens.ErrNotConnected) {
 		s.log.Error("disconnect: clear", "user", user, "err", err)
+	}
+	u, _, err := s.Store.Get(r.Context(), user)
+	if err != nil {
+		s.log.Error("disconnect: store get", "user", user, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
 	if u.RefreshToken != "" {
 		if err := s.Discord.Revoke(r.Context(), u.RefreshToken); err != nil {

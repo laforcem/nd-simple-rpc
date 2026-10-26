@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +22,9 @@ type Config struct {
 	DBPath        string
 	PublicAddr    string
 	InternalAddr  string
+	// TrustedProxyHops is how many reverse proxies append to X-Forwarded-For
+	// in front of the public port; 0 ignores the header.
+	TrustedProxyHops int
 }
 
 // Load reads and validates the configuration. Errors name variables, never
@@ -67,6 +71,14 @@ func Load(getenv func(string) string) (Config, error) {
 	c.SessionKey = key("SESSION_KEY")
 	c.PublicAddr = opt("PUBLIC_ADDR", ":8080")
 	c.InternalAddr = opt("INTERNAL_ADDR", ":8081")
+	c.TrustedProxyHops = 1
+	if v := getenv("TRUSTED_PROXY_HOPS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 5 {
+			errs = append(errs, errors.New("TRUSTED_PROXY_HOPS must be an integer from 0 to 5"))
+		}
+		c.TrustedProxyHops = n
+	}
 	if v := req("PUBLIC_URL"); v != "" {
 		u, err := parsePublicURL(v)
 		if err != nil {
