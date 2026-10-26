@@ -55,11 +55,18 @@ The companion image runs as UID 65532. A named volume at `/state` works as is; a
 
 ### Service name
 
-The companion's Compose service (or Kubernetes Service) must be named `nd-simple-rpc`. The plugin's manifest allows outbound HTTP only to the host `nd-simple-rpc`, `nd-simple-rpc.*` and the private ranges `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`. Any other name is blocked by Navidrome.
+The plugin's manifest allows outbound HTTP only to the exact host `nd-simple-rpc` and the private ranges `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`. Navidrome matches host names exactly (wildcards only as a leading `*.`), so `companionUrl` must use one of:
+
+- the bare name `nd-simple-rpc`: name the Compose service (or Kubernetes Service) `nd-simple-rpc` and run it on the same Compose network (or in the same namespace) as Navidrome, or
+- a private IP literal, for example `http://10.43.0.12:8081`.
+
+Fully qualified or cross-namespace names (`nd-simple-rpc.media.svc.cluster.local`, `nd-simple-rpc.example.com`) are blocked.
 
 ## One-time Navidrome step
 
-As an admin, in Navidrome's plugin settings:
+First, make sure Navidrome knows its own public address: set `ND_BASEURL` to the full public URL (for example `https://music.example.com`) or set `ND_SHAREURL` to it. Cover URLs are built from it, and Discord fetches covers from the internet, so without it Discord cannot fetch the cover.
+
+Then, as an admin, in Navidrome's plugin settings:
 
 1. Enable the `nd-simple-rpc` plugin.
 2. Set `companionUrl` to the internal address, for example `http://nd-simple-rpc:8081`.

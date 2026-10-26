@@ -5,7 +5,7 @@ WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/nd-simple-rpc ./cmd/nd-simple-rpc
 # Stock Go (wasip1) builds the plugin; TinyGo is used only if installed.
-RUN make -C plugin package
+RUN make -C plugin package VERSION="${VERSION}"
 RUN mkdir /state
 
 FROM gcr.io/distroless/static:nonroot
