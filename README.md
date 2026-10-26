@@ -73,6 +73,8 @@ Then, as an admin, in Navidrome's plugin settings:
 3. Set `sharedSecret` to the same value as the companion's `SHARED_SECRET`.
 4. Grant the plugin access to all users (it needs this to look up track details as each user).
 
+**After every upgrade, re-enable the plugin.** Navidrome disables any plugin whose file changes, and installing a new version (or a different `--connect-url`) changes it. Your settings are kept; only the enabled switch resets.
+
 Then each user opens the companion's public URL, signs in with their Navidrome account, and clicks Connect Discord. Discord's consent screen lists friends-list permissions the service does not use; that is the cost of the only scope that allows presence.
 
 ## Limitations
