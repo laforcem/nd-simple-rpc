@@ -27,7 +27,7 @@ import (
 var version = "dev"
 
 const (
-	usage      = "usage: nd-simple-rpc [serve | install-plugin [--src FILE] DIR]\n"
+	usage      = "usage: nd-simple-rpc [serve | install-plugin [--src FILE] [--connect-url URL] DIR]\n"
 	defaultSrc = "/plugin/nd-simple-rpc.ndp"
 )
 
@@ -59,13 +59,14 @@ func main() {
 func installPlugin(args []string) error {
 	fs := flag.NewFlagSet("install-plugin", flag.ContinueOnError)
 	src := fs.String("src", defaultSrc, "plugin file to install")
+	connectURL := fs.String("connect-url", "", "sign-in page URL to show as the plugin's website link in Navidrome")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return errors.New("want exactly one destination directory")
 	}
-	changed, err := install.Plugin(*src, fs.Arg(0))
+	changed, err := install.Plugin(*src, fs.Arg(0), *connectURL)
 	if err != nil {
 		return err
 	}

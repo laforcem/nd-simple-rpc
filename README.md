@@ -49,7 +49,7 @@ See [`examples/docker-compose.yml`](examples/docker-compose.yml). The shape:
 2. `navidrome` waits for it (`service_completed_successfully`) and runs with `ND_PLUGINS_AUTORELOAD=true`, so a new plugin version loads without a restart.
 3. `nd-simple-rpc` is the companion. Put a reverse proxy in front of the public port (`8080`) only.
 
-`install-plugin` takes `--src` to install a plugin file other than the bundled `/plugin/nd-simple-rpc.ndp`. The `.ndp` is also attached to each GitHub release for manual installs.
+`install-plugin` takes `--src` to install a plugin file other than the bundled `/plugin/nd-simple-rpc.ndp`, and `--connect-url https://presence.example.com` to replace the plugin's website with your sign-in page, so Navidrome's plugin page (admins only) links to it. The `.ndp` is also attached to each GitHub release for manual installs.
 
 The companion image runs as UID 65532. A named volume at `/state` works as is; a bind mount must be owned by UID 65532.
 
