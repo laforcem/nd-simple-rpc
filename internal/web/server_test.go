@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +100,10 @@ func newEnv(t *testing.T, ndUser string) *env {
 		e.ndHits.Add(1)
 		if body.Password == "bad" {
 			time.Sleep(20 * time.Millisecond)
+		}
+		if body.Password == "limited" {
+			w.WriteHeader(429)
+			return
 		}
 		if body.Password != "good" {
 			w.WriteHeader(401)
@@ -725,5 +730,71 @@ func TestFailureMapBounded(t *testing.T) {
 	}
 	if _, ok := s.failures["ip-10049"]; !ok {
 		t.Fatal("newest entry dropped")
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	e := newEnv(t, "Malc")
+	w := e.do("GET", "/", nil, nil, nil)
+	csp := w.Header().Get("Content-Security-Policy")
+	for _, d := range []string{"default-src 'none'", "frame-ancestors 'none'", "form-action 'self'"} {
+		if !strings.Contains(csp, d) {
+			t.Errorf("CSP %q lacks %q", csp, d)
+		}
+	}
+	if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q", got)
+	}
+}
+
+func TestLogoutRevokesOtherSessions(t *testing.T) {
+	e := newEnv(t, "Malc")
+	a := e.login(t, "malc")
+	b := e.login(t, "malc")
+	w := e.do("POST", "/logout", url.Values{"csrf": {e.csrfFor(t, a)}}, []*http.Cookie{a}, nil)
+	if w.Code != 303 {
+		t.Fatalf("logout %d", w.Code)
+	}
+	for name, c := range map[string]*http.Cookie{"same": a, "other": b} {
+		if w := e.do("GET", "/settings", nil, []*http.Cookie{c}, nil); w.Code != 302 {
+			t.Errorf("%s session still valid: %d", name, w.Code)
+		}
+	}
+	// A fresh login works again.
+	c := e.login(t, "malc")
+	if w := e.do("GET", "/settings", nil, []*http.Cookie{c}, nil); w.Code != 200 {
+		t.Fatalf("new session: %d", w.Code)
+	}
+}
+
+func TestLegacySessionCookieRejected(t *testing.T) {
+	e := newEnv(t, "Malc")
+	k := sha256.Sum256(append([]byte("nd-simple-rpc/web/v1\x00"), bytes.Repeat([]byte{9}, 32)...))
+	srv := &server{key: k[:]}
+	// Pre-generation format: the payload is the bare encoded username.
+	legacy := &http.Cookie{Name: "__Host-nsr_session", Value: srv.sign("session", b64.EncodeToString([]byte("Malc")), time.Hour)}
+	if w := e.do("GET", "/settings", nil, []*http.Cookie{legacy}, nil); w.Code != 302 {
+		t.Fatalf("legacy cookie accepted: %d", w.Code)
+	}
+	// Sanity: the same key signs a current-format cookie that is accepted.
+	cur := &http.Cookie{Name: "__Host-nsr_session", Value: srv.sessionValue("Malc", 0)}
+	if w := e.do("GET", "/settings", nil, []*http.Cookie{cur}, nil); w.Code != 200 {
+		t.Fatalf("current cookie rejected: %d", w.Code)
+	}
+}
+
+func TestNavidromeRateLimitCountsAsFailure(t *testing.T) {
+	e := newEnv(t, "Malc")
+	hdr := map[string]string{"X-Forwarded-For": "1.2.3.4"}
+	for i := 0; i < 5; i++ {
+		w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"limited"}}, nil, hdr)
+		if w.Code != 429 {
+			t.Fatalf("attempt %d: %d", i, w.Code)
+		}
+	}
+	before := e.ndHits.Load()
+	w := e.do("POST", "/login", url.Values{"username": {"m"}, "password": {"good"}}, nil, hdr)
+	if w.Code != 429 || e.ndHits.Load() != before {
+		t.Fatalf("not limited locally: %d, hits %d->%d", w.Code, before, e.ndHits.Load())
 	}
 }

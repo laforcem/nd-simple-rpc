@@ -256,3 +256,29 @@ func TestSetTokens(t *testing.T) {
 		t.Errorf("needs-reconnect row changed: %+v", got)
 	}
 }
+
+func TestSessionGeneration(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	if g, err := s.SessionGeneration(ctx, "Malc"); err != nil || g != 0 {
+		t.Fatalf("fresh: %d, %v", g, err)
+	}
+	for want := int64(1); want <= 2; want++ {
+		if err := s.BumpSessionGeneration(ctx, "Malc"); err != nil {
+			t.Fatal(err)
+		}
+		if g, _ := s.SessionGeneration(ctx, "Malc"); g != want {
+			t.Fatalf("after bump: %d want %d", g, want)
+		}
+	}
+	// Deleting the user row must not reset the generation.
+	if err := s.Delete(ctx, "Malc"); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := s.SessionGeneration(ctx, "Malc"); g != 2 {
+		t.Fatalf("after delete: %d", g)
+	}
+	if g, _ := s.SessionGeneration(ctx, "Other"); g != 0 {
+		t.Fatalf("other user: %d", g)
+	}
+}

@@ -48,6 +48,13 @@ const schema = `CREATE TABLE IF NOT EXISTS users (
 	needs_reconnect   INTEGER NOT NULL DEFAULT 0
 )`
 
+// web_sessions outlives users rows: Delete must not reset a generation and
+// revive old cookies.
+const sessionSchema = `CREATE TABLE IF NOT EXISTS web_sessions (
+	username   TEXT PRIMARY KEY,
+	generation INTEGER NOT NULL DEFAULT 0
+)`
+
 const cols = `username, discord_user_id, discord_username, refresh_token, access_token,
 	access_expires_at, paused, session_token, needs_reconnect`
 
@@ -63,6 +70,10 @@ func Open(path string, key []byte) (*Store, error) {
 		return nil, err
 	}
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: create schema: %w", err)
+	}
+	if _, err := db.Exec(sessionSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: create schema: %w", err)
 	}
@@ -228,6 +239,23 @@ func (s *Store) ListWithSessions(ctx context.Context) ([]User, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// SessionGeneration returns the user's web session generation; 0 if never bumped.
+func (s *Store) SessionGeneration(ctx context.Context, username string) (int64, error) {
+	var g int64
+	err := s.db.QueryRowContext(ctx, `SELECT generation FROM web_sessions WHERE username = ?`, username).Scan(&g)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return g, err
+}
+
+// BumpSessionGeneration invalidates every web session issued to the user.
+func (s *Store) BumpSessionGeneration(ctx context.Context, username string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO web_sessions (username, generation) VALUES (?, 1)
+		ON CONFLICT(username) DO UPDATE SET generation = generation + 1`, username)
+	return err
 }
 
 func b2i(b bool) int {

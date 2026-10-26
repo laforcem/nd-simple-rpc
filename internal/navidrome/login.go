@@ -16,6 +16,10 @@ import (
 // ErrBadCredentials means Navidrome rejected the username or password.
 var ErrBadCredentials = errors.New("navidrome: bad credentials")
 
+// ErrRateLimited means Navidrome refused the attempt with 429. Every
+// companion login comes from one address, so this is a shared limit.
+var ErrRateLimited = errors.New("navidrome: login rate limited")
+
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // Login verifies a Navidrome username and password and returns the canonical
@@ -42,6 +46,8 @@ func Login(ctx context.Context, baseURL, username, password string) (string, err
 	case http.StatusOK:
 	case http.StatusUnauthorized:
 		return "", ErrBadCredentials
+	case http.StatusTooManyRequests:
+		return "", ErrRateLimited
 	default:
 		return "", fmt.Errorf("navidrome: login returned status %d", resp.StatusCode)
 	}

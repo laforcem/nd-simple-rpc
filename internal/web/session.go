@@ -13,7 +13,7 @@ import (
 const (
 	sessionCookie = "__Host-nsr_session"
 	oauthCookie   = "__Host-nsr_oauth"
-	sessionTTL    = 30 * 24 * time.Hour
+	sessionTTL    = 24 * time.Hour
 	oauthTTL      = 10 * time.Minute
 )
 
@@ -54,20 +54,30 @@ func (s *server) verify(purpose, value string) (string, bool) {
 	return body[:j], true
 }
 
-func (s *server) sessionValue(username string) string {
-	return s.sign("session", b64.EncodeToString([]byte(username)), sessionTTL)
+// sessionValue binds the cookie to the user's session generation, so
+// bumping it in the store revokes every cookie issued before.
+func (s *server) sessionValue(username string, gen int64) string {
+	return s.sign("session", b64.EncodeToString([]byte(username))+"~"+strconv.FormatInt(gen, 10), sessionTTL)
 }
 
-func (s *server) sessionUser(value string) (string, bool) {
+func (s *server) sessionUser(value string) (user string, gen int64, ok bool) {
 	p, ok := s.verify("session", value)
 	if !ok {
-		return "", false
+		return "", 0, false
 	}
-	b, err := b64.DecodeString(p)
+	enc, g, found := strings.Cut(p, "~")
+	if !found {
+		return "", 0, false
+	}
+	b, err := b64.DecodeString(enc)
 	if err != nil || len(b) == 0 {
-		return "", false
+		return "", 0, false
 	}
-	return string(b), true
+	gen, err = strconv.ParseInt(g, 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return string(b), gen, true
 }
 
 func (s *server) csrf(sessionValue string) string { return s.mac("csrf", sessionValue) }

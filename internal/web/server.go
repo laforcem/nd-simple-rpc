@@ -102,11 +102,17 @@ func NewPublic(d Deps) (http.Handler, error) {
 	return noStore(mux), nil
 }
 
+// csp allows no scripts, no framing, and form posts only to this origin.
+// The templates use inline <style> and nothing else.
+const csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+
 func noStore(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Content-Security-Policy", csp)
+		w.Header().Set("X-Frame-Options", "DENY")
 		h.ServeHTTP(w, r)
 	})
 }
@@ -125,8 +131,19 @@ func (s *server) currentUser(r *http.Request) (user, sessionValue string, ok boo
 	if err != nil {
 		return "", "", false
 	}
-	user, ok = s.sessionUser(c.Value)
-	return user, c.Value, ok
+	user, gen, ok := s.sessionUser(c.Value)
+	if !ok {
+		return "", "", false
+	}
+	cur, err := s.Store.SessionGeneration(r.Context(), user)
+	if err != nil {
+		s.log.Error("session generation", "err", err)
+		return "", "", false
+	}
+	if gen != cur {
+		return "", "", false
+	}
+	return user, c.Value, true
 }
 
 func (s *server) auth(h handler) http.HandlerFunc {
@@ -314,6 +331,11 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, navidrome.ErrBadCredentials):
 		s.render(w, http.StatusOK, "login.html", map[string]any{"Error": "Invalid username or password."})
 		return
+	case errors.Is(err, navidrome.ErrRateLimited):
+		// Keep the reserved slot: a flood that trips Navidrome's limit
+		// must also count against the flooding client here.
+		s.render(w, http.StatusTooManyRequests, "login.html", map[string]any{"Error": "Too many sign-in attempts. Try again later."})
+		return
 	case err != nil:
 		release()
 		s.log.Error("navidrome login failed", "err", err)
@@ -321,7 +343,13 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	release()
-	s.setCookie(w, sessionCookie, s.sessionValue(canonical), int(sessionTTL/time.Second))
+	gen, err := s.Store.SessionGeneration(r.Context(), canonical)
+	if err != nil {
+		s.log.Error("login: session generation", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.setCookie(w, sessionCookie, s.sessionValue(canonical, gen), int(sessionTTL/time.Second))
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 
@@ -471,7 +499,13 @@ func (s *server) disconnect(w http.ResponseWriter, r *http.Request, user string)
 	http.Redirect(w, r, "/settings", http.StatusSeeOther)
 }
 
-func (s *server) logout(w http.ResponseWriter, r *http.Request, _ string) {
+// logout signs the user out on every device, not just this browser.
+func (s *server) logout(w http.ResponseWriter, r *http.Request, user string) {
+	if err := s.Store.BumpSessionGeneration(r.Context(), user); err != nil {
+		s.log.Error("logout: bump session generation", "user", user, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	s.setCookie(w, sessionCookie, "", -1)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

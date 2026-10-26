@@ -58,3 +58,13 @@ func TestLoginEmptyUsernameIsError(t *testing.T) {
 		t.Fatal("want error")
 	}
 }
+
+func TestLoginRateLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+	}))
+	defer srv.Close()
+	if _, err := Login(context.Background(), srv.URL, "a", "b"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v", err)
+	}
+}
