@@ -10,6 +10,10 @@ import (
 // maxText is Discord's per-field text limit, in characters.
 const maxText = 128
 
+// unknownArtist fills Name and State when the event has no artist; the
+// event carries no album artist to fall back on.
+const unknownArtist = "Unknown Artist"
+
 // Timestamps are unix milliseconds.
 type Timestamps struct {
 	Start int64 `json:"start"`
@@ -50,6 +54,9 @@ func Build(ev event.Playback, appID string) Activity {
 	start := ev.Timestamp*1000 - int64(float64(ev.PositionMs)/rate)
 	end := start + int64(float64(ev.Track.DurationMs)/rate)
 	artist := truncate(ev.Track.Artist)
+	if artist == "" {
+		artist = unknownArtist
+	}
 	return Activity{
 		Type:          2,
 		Name:          artist,

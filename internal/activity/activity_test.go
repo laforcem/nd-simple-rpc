@@ -123,3 +123,12 @@ func TestChanged(t *testing.T) {
 		t.Error("different large image should be changed")
 	}
 }
+
+func TestBuildEmptyArtist(t *testing.T) {
+	ev := fixture(t)
+	ev.Track.Artist = ""
+	a := Build(ev, "app1")
+	if a.Name != "Unknown Artist" || a.State != "Unknown Artist" {
+		t.Errorf("name/state = %q/%q, want Unknown Artist", a.Name, a.State)
+	}
+}

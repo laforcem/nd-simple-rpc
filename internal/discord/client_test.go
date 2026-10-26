@@ -309,3 +309,43 @@ func TestErrorsDoNotContainTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenRejectsIncompleteSuccess(t *testing.T) {
+	for _, body := range []string{
+		`{"refresh_token":"rt2","expires_in":60}`,
+		`{"access_token":"","refresh_token":"rt2","expires_in":60}`,
+		`{"access_token":"at2","refresh_token":"rt2","expires_in":0}`,
+		`{"access_token":"at2","refresh_token":"rt2","expires_in":-5}`,
+		`{"access_token":"at2","refresh_token":"rt2"}`,
+	} {
+		c := newTest(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) })
+		ts, err := c.Refresh(context.Background(), "old")
+		if err == nil || errors.Is(err, ErrInvalidGrant) {
+			t.Errorf("%s: ts=%+v err=%v, want error", body, ts, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "rt2") || strings.Contains(err.Error(), "at2") {
+			t.Errorf("%s: token in error: %v", body, err)
+		}
+	}
+}
+
+func TestRetryAfterBounds(t *testing.T) {
+	cases := map[string]time.Duration{
+		"NaN":  defaultRetry,
+		"Inf":  defaultRetry,
+		"+Inf": defaultRetry,
+		"-1":   defaultRetry,
+		"3600": 10 * time.Minute,
+		"1e30": 10 * time.Minute,
+		"601":  10 * time.Minute,
+		"599":  599 * time.Second,
+	}
+	for v, want := range cases {
+		h := http.Header{}
+		h.Set("Retry-After", v)
+		if got := retryAfter(h); got != want {
+			t.Errorf("Retry-After %q: %v, want %v", v, got, want)
+		}
+	}
+}

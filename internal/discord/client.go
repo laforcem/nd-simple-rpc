@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -26,6 +27,7 @@ const (
 	scope           = "openid sdk.social_layer_presence"
 	requestTimeout  = 10 * time.Second
 	defaultRetry    = 2 * time.Second
+	maxRetry        = 10 * time.Minute
 	maxResponseBody = 1 << 20
 )
 
@@ -188,6 +190,9 @@ func (c *Client) token(ctx context.Context, form url.Values) (TokenSet, error) {
 	if err := json.Unmarshal(resp.body, &t); err != nil {
 		return TokenSet{}, fmt.Errorf("discord: token: decode response: %w", err)
 	}
+	if t.AccessToken == "" || t.ExpiresIn <= 0 {
+		return TokenSet{}, fmt.Errorf("discord: token: response missing access_token or a positive expires_in")
+	}
 	return TokenSet{
 		AccessToken:  t.AccessToken,
 		RefreshToken: t.RefreshToken,
@@ -256,7 +261,10 @@ func (c *Client) check(op string, r *response, sessionEndpoint bool) error {
 func retryAfter(h http.Header) time.Duration {
 	for _, k := range []string{"Retry-After", "X-RateLimit-Reset-After"} {
 		if v := h.Get(k); v != "" {
-			if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 {
+				if f >= maxRetry.Seconds() {
+					return maxRetry
+				}
 				return time.Duration(f * float64(time.Second))
 			}
 		}
