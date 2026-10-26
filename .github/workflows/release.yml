@@ -13,13 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Build plugin
-        run: make -C plugin package
-
       - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v4
@@ -40,4 +33,13 @@ jobs:
       - name: Attach plugin to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" plugin/nd-simple-rpc.ndp --generate-notes --title "$GITHUB_REF_NAME"
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+        run: |
+          cid=$(docker create "$IMAGE")
+          docker cp "$cid:/plugin/nd-simple-rpc.ndp" nd-simple-rpc.ndp
+          docker rm "$cid"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" nd-simple-rpc.ndp --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" nd-simple-rpc.ndp --generate-notes --title "$GITHUB_REF_NAME"
+          fi

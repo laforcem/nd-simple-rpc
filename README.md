@@ -50,6 +50,8 @@ See [`examples/docker-compose.yml`](examples/docker-compose.yml). The shape:
 
 `install-plugin` takes `--src` to install a plugin file other than the bundled `/plugin/nd-simple-rpc.ndp`. The `.ndp` is also attached to each GitHub release for manual installs.
 
+The companion image runs as UID 65532. A named volume at `/state` works as is; a bind mount must be owned by UID 65532.
+
 ### Service name
 
 The companion's Compose service (or Kubernetes Service) must be named `nd-simple-rpc`. The plugin's manifest allows outbound HTTP only to the host `nd-simple-rpc`, `nd-simple-rpc.*` and the private ranges `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`. Any other name is blocked by Navidrome.
