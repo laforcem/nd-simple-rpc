@@ -37,8 +37,17 @@ services:
       DB_PATH: /state/nd-simple-rpc.db
     volumes:
       - nd-simple-rpc-state:/state
+    read_only: true
+    tmpfs:
+      - /tmp # SQLite temp files
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "8080:8080" # public: put your reverse proxy in front of this
+      # public: put your reverse proxy in front of this. Loopback only:
+      # Docker's published ports bypass host firewalls, and a client that
+      # reaches 8080 directly can forge X-Forwarded-For.
+      - "127.0.0.1:8080:8080"
       # 8081 (internal) is deliberately not published.
 
 volumes:

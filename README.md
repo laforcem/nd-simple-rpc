@@ -47,7 +47,7 @@ See [`examples/docker-compose.yml`](examples/docker-compose.yml). The shape:
 
 1. `nd-simple-rpc-plugin` is a one-shot container that runs `nd-simple-rpc install-plugin /data/plugins` against Navidrome's data volume. It writes atomically and does nothing if the file is already identical.
 2. `navidrome` waits for it (`service_completed_successfully`) and runs with `ND_PLUGINS_AUTORELOAD=true`, so a new plugin version loads without a restart.
-3. `nd-simple-rpc` is the companion. Put a reverse proxy in front of the public port (`8080`) only.
+3. `nd-simple-rpc` is the companion. Put a reverse proxy in front of the public port (`8080`) only, and make sure nothing else can reach it: the login rate limit trusts `X-Forwarded-For`, so a client that connects directly can forge it.
 
 `install-plugin` takes `--src` to install a plugin file other than the bundled `/plugin/nd-simple-rpc.ndp`, and `--connect-url https://presence.example.com` to replace the plugin's website with your sign-in page, so Navidrome's plugin page (admins only) links to it. The `.ndp` is also attached to each GitHub release for manual installs.
 
