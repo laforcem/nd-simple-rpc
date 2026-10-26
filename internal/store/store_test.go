@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,5 +195,64 @@ func TestOpenRejectsShortKey(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "x.db"), []byte("short"))
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestExpireAccessToken(t *testing.T) {
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	exp := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.Put(ctx, User{Username: "a", RefreshToken: "rt", AccessToken: "at", AccessExpiresAt: exp, Paused: true, SessionToken: "st"})
+	if err := s.ExpireAccessToken(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get(ctx, "a")
+	if !got.AccessExpiresAt.IsZero() {
+		t.Errorf("expiry = %v, want zero", got.AccessExpiresAt)
+	}
+	if got.RefreshToken != "rt" || !got.Paused || got.SessionToken != "st" {
+		t.Errorf("other fields changed: %+v", got)
+	}
+	if err := s.ExpireAccessToken(ctx, "nobody"); err != nil {
+		t.Errorf("absent user: %v", err)
+	}
+}
+
+func TestSetTokens(t *testing.T) {
+	s, path := openTemp(t)
+	ctx := context.Background()
+	exp := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	s.Put(ctx, User{Username: "a", DiscordUserID: "d", RefreshToken: "rt", AccessToken: "at", Paused: true, SessionToken: "st"})
+	if err := s.SetTokens(ctx, "a", "at-new", "rt-new", exp); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get(ctx, "a")
+	if got.AccessToken != "at-new" || got.RefreshToken != "rt-new" || !got.AccessExpiresAt.Equal(exp) {
+		t.Errorf("tokens not stored: %+v", got)
+	}
+	if !got.Paused || got.SessionToken != "st" || got.DiscordUserID != "d" {
+		t.Errorf("other fields changed: %+v", got)
+	}
+	files, _ := filepath.Glob(path + "*")
+	for _, f := range files {
+		raw, _ := os.ReadFile(f)
+		if bytes.Contains(raw, []byte("rt-new")) || bytes.Contains(raw, []byte("at-new")) {
+			t.Errorf("%s holds plaintext tokens", f)
+		}
+	}
+
+	if err := s.SetTokens(ctx, "nobody", "x", "y", exp); !errors.Is(err, ErrNotUpdated) {
+		t.Errorf("absent user err = %v, want ErrNotUpdated", err)
+	}
+	if _, ok, _ := s.Get(ctx, "nobody"); ok {
+		t.Error("absent user inserted")
+	}
+
+	s.MarkNeedsReconnect(ctx, "a")
+	if err := s.SetTokens(ctx, "a", "x", "y", exp); !errors.Is(err, ErrNotUpdated) {
+		t.Errorf("needs-reconnect err = %v, want ErrNotUpdated", err)
+	}
+	if got, _, _ := s.Get(ctx, "a"); got.RefreshToken != "" || !got.NeedsReconnect {
+		t.Errorf("needs-reconnect row changed: %+v", got)
 	}
 }

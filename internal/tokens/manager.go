@@ -81,12 +81,26 @@ func (m *Manager) AccessToken(ctx context.Context, username string) (string, err
 	if ts.RefreshToken == "" {
 		ts.RefreshToken = u.RefreshToken
 	}
-	u.AccessToken = ts.AccessToken
-	u.RefreshToken = ts.RefreshToken
-	u.AccessExpiresAt = ts.ExpiresAt
-	// Persist before returning: the old refresh token is now dead.
-	if err := m.Store.Put(ctx, u); err != nil {
+	// Persist before returning: the old refresh token is now dead. Only the
+	// token columns are written, so a concurrent pause is kept, and a row
+	// deleted or flagged meanwhile is left alone.
+	if err := m.Store.SetTokens(ctx, username, ts.AccessToken, ts.RefreshToken, ts.ExpiresAt); err != nil {
+		if errors.Is(err, store.ErrNotUpdated) {
+			return "", ErrNotConnected
+		}
 		return "", fmt.Errorf("tokens: persist refreshed tokens: %w", err)
 	}
-	return u.AccessToken, nil
+	return ts.AccessToken, nil
+}
+
+// Invalidate marks username's stored access token as expired, so the next
+// AccessToken call refreshes it (for example after Discord answered 401).
+func (m *Manager) Invalidate(ctx context.Context, username string) error {
+	l := m.userLock(username)
+	l.Lock()
+	defer l.Unlock()
+	if err := m.Store.ExpireAccessToken(ctx, username); err != nil {
+		return fmt.Errorf("tokens: invalidate: %w", err)
+	}
+	return nil
 }

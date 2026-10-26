@@ -29,6 +29,8 @@ type Users interface {
 // Tokens hands out Discord access tokens.
 type Tokens interface {
 	AccessToken(ctx context.Context, username string) (string, error)
+	// Invalidate forces the next AccessToken call to refresh.
+	Invalidate(ctx context.Context, username string) error
 }
 
 // Publisher creates, updates and deletes headless sessions.
@@ -56,6 +58,21 @@ const (
 	opDelete
 )
 
+const (
+	errBackoffMin = 2 * time.Second
+	errBackoffMax = 5 * time.Minute
+)
+
+// errorBackoff is the wait after the step-th consecutive failed call:
+// 2 s doubling to a 5 min cap.
+func errorBackoff(step int) time.Duration {
+	d := errBackoffMin
+	for i := 1; i < step && d < errBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, errBackoffMax)
+}
+
 func (o op) String() string {
 	switch o {
 	case opPut:
@@ -79,8 +96,12 @@ type userState struct {
 	session      string // mirror of the stored session token
 	posted       *activity.Activity
 	lastPut      time.Time
-	backoffUntil time.Time
+	backoffUntil time.Time // 429 Retry-After
 	lim          limiter
+
+	errStep     int       // consecutive failed calls (non-429)
+	errUntil    time.Time // no reconcile call before this
+	rejectedGen uint64    // Discord rejected the create for this gen; 0: none
 }
 
 // Engine is the presence reconciler. Safe for concurrent use.
@@ -145,6 +166,7 @@ func (e *Engine) HandlePlayback(ev event.Playback) {
 	st.desired = desired
 	st.expectedEnd = end
 	st.gen++
+	st.errStep, st.errUntil = 0, time.Time{}
 }
 
 // Tick reconciles every known user once.
@@ -177,15 +199,15 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// Clear deletes the user's live session now, ignoring the rolling window but
-// honouring a pending 429 back-off. On any error the desired state stays
-// "none", so a later Tick retries the delete.
+// Clear deletes the user's live session now, ignoring the rolling window and
+// the error back-off but honouring a pending 429 back-off. It keeps the
+// desired activity: callers set the user's Paused flag first, which keeps
+// Tick from re-posting (and makes it retry a failed delete) until resumed.
 func (e *Engine) Clear(ctx context.Context, username string) error {
 	st := e.lockUser(username, true)
 	defer st.op.Unlock()
 
 	e.mu.Lock()
-	st.desired = nil
 	known := st.sessionKnown
 	e.mu.Unlock()
 
@@ -312,7 +334,8 @@ func (e *Engine) reconcile(ctx context.Context, name string) {
 		e.mu.Unlock()
 		return
 	}
-	if now.Before(st.backoffUntil) || !st.lim.allow(now, e.cfg.RateMax, e.cfg.RateWindow) {
+	if now.Before(st.backoffUntil) || now.Before(st.errUntil) ||
+		!st.lim.allow(now, e.cfg.RateMax, e.cfg.RateWindow) {
 		e.mu.Unlock()
 		return
 	}
@@ -321,14 +344,28 @@ func (e *Engine) reconcile(ctx context.Context, name string) {
 
 	err = e.call(ctx, name, st, o, session, act, gen)
 	var rl *discord.RateLimitError
-	if err != nil && !errors.Is(err, tokens.ErrNotConnected) && !errors.Is(err, discord.ErrSessionGone) &&
-		!errors.Is(err, discord.ErrUnauthorized) && !errors.As(err, &rl) {
-		e.log.Warn("presence: discord call failed", "user", name, "op", o.String(), "err", err)
+	if err == nil || errors.Is(err, tokens.ErrNotConnected) || errors.Is(err, discord.ErrSessionGone) ||
+		errors.As(err, &rl) {
+		return
 	}
+	// Anything else (401, 403, 5xx, transport, refresh failure) backs off.
+	// One warning per step; err never carries tokens or URLs.
+	e.mu.Lock()
+	st.errStep++
+	wait := errorBackoff(st.errStep)
+	st.errUntil = e.now().Add(wait)
+	e.mu.Unlock()
+	e.log.Warn("presence: discord call failed, backing off", "user", name, "op", o.String(),
+		"retry_in", wait.String(), "err", err)
 }
 
 // decideLocked picks the one call (if any) that moves Discord towards want.
 func (e *Engine) decideLocked(st *userState, want *activity.Activity, now time.Time) (op, *activity.Activity) {
+	if want != nil && st.rejectedGen != 0 && st.rejectedGen == st.gen {
+		// Discord rejected this payload (and holds no session for it, since
+		// only a create can be rejected); wait for the next event.
+		return opNone, nil
+	}
 	switch {
 	case want != nil && st.session == "":
 		return opPut, want
@@ -371,11 +408,22 @@ func (e *Engine) call(ctx context.Context, name string, st *userState, o op, ses
 	case err == nil && o == opPut:
 		e.mu.Lock()
 		st.session, st.posted, st.lastPut = tok, act, e.now()
+		st.errStep, st.errUntil = 0, time.Time{}
 		e.mu.Unlock()
 		e.persist(ctx, name, tok)
+	case o == opPut && session == "" && errors.Is(err, discord.ErrSessionGone):
+		// A create has no session to lose: the 400 rejects the payload.
+		e.mu.Lock()
+		st.rejectedGen = gen
+		e.mu.Unlock()
+		e.log.Warn("presence: discord rejected the activity; not retrying until the next playback event",
+			"user", name, "status", "400 Bad Request")
 	case err == nil || errors.Is(err, discord.ErrSessionGone):
 		e.mu.Lock()
 		st.session, st.posted = "", nil
+		if err == nil {
+			st.errStep, st.errUntil = 0, time.Time{}
+		}
 		e.mu.Unlock()
 		e.persist(ctx, name, "")
 		if o == opDelete {
@@ -385,6 +433,12 @@ func (e *Engine) call(ctx context.Context, name string, st *userState, o op, ses
 		e.mu.Lock()
 		st.backoffUntil = e.now().Add(rl.RetryAfter)
 		e.mu.Unlock()
+	case errors.Is(err, discord.ErrUnauthorized):
+		// The access token may have been revoked or rotated early; make the
+		// next attempt refresh, which recovers or ends in NeedsReconnect.
+		if ierr := e.tokens.Invalidate(ctx, name); ierr != nil {
+			e.log.Warn("presence: invalidate access token failed", "user", name, "err", ierr)
+		}
 	}
 	return err
 }

@@ -13,6 +13,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// ErrNotUpdated means a narrow update matched no row: the user is absent or,
+// for SetTokens, flagged for reconnection.
+var ErrNotUpdated = errors.New("store: no matching user row")
+
 // User is one linked Navidrome user. Tokens are plaintext in memory.
 type User struct {
 	Username        string
@@ -159,6 +163,45 @@ func (s *Store) SetSessionToken(ctx context.Context, username, token string) err
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE users SET session_token = ? WHERE username = ?`, blob, username)
+	return err
+}
+
+// SetTokens stores a refreshed token set without touching any other column.
+// It only updates a row that exists and is not flagged for reconnection,
+// returning ErrNotUpdated otherwise, so a refresh racing a disconnect or a
+// reconnect flag never resurrects or overwrites that row.
+func (s *Store) SetTokens(ctx context.Context, username, access, refresh string, exp time.Time) error {
+	at, err := seal(s.aead, access)
+	if err != nil {
+		return err
+	}
+	rt, err := seal(s.aead, refresh)
+	if err != nil {
+		return err
+	}
+	var e int64
+	if !exp.IsZero() {
+		e = exp.UnixNano()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE users SET access_token = ?, refresh_token = ?, access_expires_at = ?
+		WHERE username = ? AND needs_reconnect = 0`, at, rt, e, username)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotUpdated
+	}
+	return nil
+}
+
+// ExpireAccessToken marks the stored access token as expired, so the next
+// AccessToken call refreshes it.
+func (s *Store) ExpireAccessToken(ctx context.Context, username string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET access_expires_at = 0 WHERE username = ?`, username)
 	return err
 }
 

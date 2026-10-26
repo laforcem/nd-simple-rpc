@@ -23,6 +23,8 @@ type fakeRefresher struct {
 	resp  discord.TokenSet
 	err   error
 	delay time.Duration
+	// during runs inside Refresh, between the manager's read and its persist.
+	during func()
 }
 
 func (f *fakeRefresher) Refresh(ctx context.Context, rt string) (discord.TokenSet, error) {
@@ -31,6 +33,9 @@ func (f *fakeRefresher) Refresh(ctx context.Context, rt string) (discord.TokenSe
 	f.got = append(f.got, rt)
 	f.mu.Unlock()
 	time.Sleep(f.delay)
+	if f.during != nil {
+		f.during()
+	}
 	return f.resp, f.err
 }
 
@@ -200,5 +205,61 @@ func TestUnknownUser(t *testing.T) {
 	}
 	if f.count() != 0 {
 		t.Error("Refresh called")
+	}
+}
+
+func TestRefreshKeepsConcurrentPause(t *testing.T) {
+	f := &fakeRefresher{resp: discord.TokenSet{AccessToken: "at-new", RefreshToken: "rt-new", ExpiresAt: t0.Add(time.Hour)}}
+	u := user(time.Minute)
+	u.Paused = false
+	m, _ := setup(t, u, f)
+	ctx := context.Background()
+	f.during = func() {
+		if err := m.Store.SetPaused(ctx, "Malc", true); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := m.AccessToken(ctx, "Malc"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := m.Store.Get(ctx, "Malc")
+	if !got.Paused {
+		t.Error("pause set during refresh was lost")
+	}
+	if got.RefreshToken != "rt-new" {
+		t.Errorf("refresh token = %q, want rt-new", got.RefreshToken)
+	}
+}
+
+func TestRefreshDoesNotResurrectDeletedRow(t *testing.T) {
+	f := &fakeRefresher{resp: discord.TokenSet{AccessToken: "at-new", RefreshToken: "rt-new", ExpiresAt: t0.Add(time.Hour)}}
+	m, _ := setup(t, user(time.Minute), f)
+	ctx := context.Background()
+	f.during = func() {
+		if err := m.Store.Delete(ctx, "Malc"); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := m.AccessToken(ctx, "Malc"); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("err = %v, want ErrNotConnected", err)
+	}
+	if _, ok, _ := m.Store.Get(ctx, "Malc"); ok {
+		t.Fatal("deleted row re-inserted")
+	}
+}
+
+func TestInvalidateForcesRefresh(t *testing.T) {
+	f := &fakeRefresher{resp: discord.TokenSet{AccessToken: "at-new", RefreshToken: "rt-new", ExpiresAt: t0.Add(2 * time.Hour)}}
+	m, _ := setup(t, user(time.Hour), f)
+	ctx := context.Background()
+	if err := m.Invalidate(ctx, "Malc"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.AccessToken(ctx, "Malc")
+	if err != nil || got != "at-new" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if f.count() != 1 {
+		t.Errorf("Refresh calls = %d, want 1", f.count())
 	}
 }

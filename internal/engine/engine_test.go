@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,6 +152,20 @@ type fakeTokens struct {
 	mu           sync.Mutex
 	notConnected map[string]bool
 	calls        int
+	invalidated  []string
+}
+
+func (f *fakeTokens) Invalidate(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidated = append(f.invalidated, name)
+	return nil
+}
+
+func (f *fakeTokens) invalidations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.invalidated...)
 }
 
 func (f *fakeTokens) AccessToken(_ context.Context, name string) (string, error) {
@@ -173,7 +190,27 @@ type harness struct {
 	pub *fakePub
 	us  *fakeUsers
 	tok *fakeTokens
+	log *syncBuffer
 }
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func (s *syncBuffer) count(sub string) int { return strings.Count(s.String(), sub) }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
@@ -183,9 +220,11 @@ func newHarness(t *testing.T) *harness {
 		pub: &fakePub{clk: clk},
 		us:  &fakeUsers{m: map[string]store.User{"alice": {Username: "alice"}}},
 		tok: &fakeTokens{notConnected: map[string]bool{}},
+		log: &syncBuffer{},
 	}
 	cfg := Config{AppID: "app", Keepalive: 15 * time.Minute, Grace: 30 * time.Second,
-		Tolerance: 3 * time.Second, RateMax: 4, RateWindow: 20 * time.Second}
+		Tolerance: 3 * time.Second, RateMax: 4, RateWindow: 20 * time.Second,
+		Logger: slog.New(slog.NewTextHandler(h.log, nil))}
 	h.e = New(cfg, h.us, h.tok, h.pub, clk.now)
 	return h
 }
@@ -495,15 +534,181 @@ func TestNotConnectedIgnored(t *testing.T) {
 	})
 }
 
-func TestUnauthorizedRetriesNextTick(t *testing.T) {
+func TestUnauthorizedInvalidatesAndBacksOff(t *testing.T) {
 	h := newHarness(t)
 	h.pub.putErrs = []error{discord.ErrUnauthorized}
 	h.play("A", 0)
 	h.tick()
+	if got := h.tok.invalidations(); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("invalidated %v, want [alice]", got)
+	}
+	h.clk.advance(time.Second)
+	h.tick()
+	wantCalls(t, h.pub, 1)
 	h.clk.advance(time.Second)
 	h.tick()
 	if c := wantCalls(t, h.pub, 2)[1]; c.op != "put" || c.session != "" {
 		t.Fatalf("unexpected retry %+v", c)
+	}
+	if len(h.tok.invalidations()) != 1 {
+		t.Fatal("Invalidate called again after a successful retry")
+	}
+}
+
+func TestUnauthorizedOnDeleteAndClearInvalidates(t *testing.T) {
+	h := newHarness(t)
+	h.play("A", 0)
+	h.tick()
+	h.us.update("alice", func(u *store.User) { u.Paused = true })
+	h.pub.delErrs = []error{discord.ErrUnauthorized}
+	if err := h.e.Clear(context.Background(), "alice"); !errors.Is(err, discord.ErrUnauthorized) {
+		t.Fatalf("Clear err = %v", err)
+	}
+	if n := len(h.tok.invalidations()); n != 1 {
+		t.Fatalf("Invalidate calls = %d after Clear 401, want 1", n)
+	}
+	h.pub.delErrs = []error{discord.ErrUnauthorized}
+	h.tick()
+	if n := len(h.tok.invalidations()); n != 2 {
+		t.Fatalf("Invalidate calls = %d after tick delete 401, want 2", n)
+	}
+}
+
+func TestErrorBackoffGrowsAndCaps(t *testing.T) {
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second,
+		32 * time.Second, 64 * time.Second, 128 * time.Second, 256 * time.Second, 5 * time.Minute, 5 * time.Minute}
+	for i, w := range want {
+		if got := errorBackoff(i + 1); got != w {
+			t.Errorf("errorBackoff(%d) = %v, want %v", i+1, got, w)
+		}
+	}
+
+	h := newHarness(t)
+	h.e.cfg.RateMax = 1000 // isolate the back-off from the rolling window
+	boom := errors.New("discord: put session: unexpected status 503")
+	h.pub.putErrs = []error{boom, boom, boom, boom}
+	h.play("A", 0)
+	start := h.clk.now()
+	for i := 0; i < 400; i++ { // 40 s at 100 ms
+		h.tick()
+		h.clk.advance(100 * time.Millisecond)
+	}
+	c := h.pub.all()
+	if len(c) != 5 {
+		t.Fatalf("got %d calls, want 5: %+v", len(c), c)
+	}
+	var at []time.Duration
+	for _, x := range c {
+		at = append(at, x.at.Sub(start))
+	}
+	wantAt := []time.Duration{0, 2 * time.Second, 6 * time.Second, 14 * time.Second, 30 * time.Second}
+	for i := range wantAt {
+		if at[i] != wantAt[i] {
+			t.Fatalf("call times %v, want %v", at, wantAt)
+		}
+	}
+	if n := h.log.count("level=WARN"); n != 4 {
+		t.Fatalf("%d warnings for 4 failures, want 4:\n%s", n, h.log.String())
+	}
+	if strings.Contains(h.log.String(), "access-alice") {
+		t.Fatal("token in logs")
+	}
+}
+
+func TestErrorBackoffResets(t *testing.T) {
+	boom := errors.New("transport down")
+	t.Run("on success", func(t *testing.T) {
+		h := newHarness(t)
+		h.e.cfg.RateMax = 1000
+		h.pub.putErrs = []error{boom, boom, nil, boom}
+		h.play("A", 0)
+		h.tick() // fail: 2 s
+		h.clk.advance(2 * time.Second)
+		h.tick() // fail: 4 s
+		h.clk.advance(3900 * time.Millisecond)
+		h.tick()
+		wantCalls(t, h.pub, 2)
+		h.clk.advance(100 * time.Millisecond)
+		h.tick() // success
+		wantCalls(t, h.pub, 3)
+		h.clk.advance(time.Second)
+		h.play("B", 0)
+		h.tick() // fail again
+		wantCalls(t, h.pub, 4)
+		h.clk.advance(1900 * time.Millisecond)
+		h.tick()
+		wantCalls(t, h.pub, 4)
+		h.clk.advance(100 * time.Millisecond)
+		h.tick() // 2 s later, not 8 s
+		if c := wantCalls(t, h.pub, 5)[4]; c.act.Details != "B" {
+			t.Fatalf("unexpected retry %+v", c)
+		}
+	})
+	t.Run("on new event", func(t *testing.T) {
+		h := newHarness(t)
+		h.e.cfg.RateMax = 1000
+		h.pub.putErrs = []error{boom, boom}
+		h.play("A", 0)
+		h.tick()
+		h.clk.advance(2 * time.Second)
+		h.tick() // second failure: 4 s back-off
+		h.clk.advance(time.Second)
+		h.tick()
+		wantCalls(t, h.pub, 2)
+		h.play("B", 0)
+		h.tick()
+		if c := wantCalls(t, h.pub, 3)[2]; c.act.Details != "B" {
+			t.Fatalf("unexpected call %+v", c)
+		}
+	})
+}
+
+func TestRejectedCreateNotRetriedUntilNewEvent(t *testing.T) {
+	h := newHarness(t)
+	h.pub.putErrs = []error{discord.ErrSessionGone}
+	h.e.HandlePlayback(event.Playback{Username: "alice", State: "playing", PlaybackRate: 1,
+		Timestamp: h.clk.now().Unix(), CoverURL: "https://nd.example/cover?jwt=secret",
+		Track: event.Track{Title: "Bad", Artist: "X", DurationMs: 180_000}})
+	for i := 0; i < 30; i++ {
+		h.tick()
+		h.clk.advance(time.Second)
+	}
+	wantCalls(t, h.pub, 1)
+	logs := h.log.String()
+	if n := h.log.count("level=WARN"); n != 1 || !strings.Contains(logs, "user=alice") || !strings.Contains(logs, "400") {
+		t.Fatalf("want one warning naming the user and status:\n%s", logs)
+	}
+	if strings.Contains(logs, "cover") || strings.Contains(logs, "secret") || strings.Contains(logs, "access-alice") {
+		t.Fatalf("secret or cover URL in logs:\n%s", logs)
+	}
+	h.play("Good", 0)
+	h.tick()
+	if c := wantCalls(t, h.pub, 2)[1]; c.op != "put" || c.act.Details != "Good" {
+		t.Fatalf("unexpected call %+v", c)
+	}
+}
+
+func TestResumeRestoresWithoutEvent(t *testing.T) {
+	h := newHarness(t)
+	h.play("A", 0)
+	h.tick()
+	h.clk.advance(time.Second)
+	h.us.update("alice", func(u *store.User) { u.Paused = true })
+	if err := h.e.Clear(context.Background(), "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if c := wantCalls(t, h.pub, 2)[1]; c.op != "delete" {
+		t.Fatalf("unexpected call %+v", c)
+	}
+	h.clk.advance(time.Second)
+	h.tick()
+	wantCalls(t, h.pub, 2)
+	h.us.update("alice", func(u *store.User) { u.Paused = false })
+	h.clk.advance(time.Second)
+	h.tick()
+	c := wantCalls(t, h.pub, 3)
+	if c[2].op != "put" || c[2].session != "" || activity.Changed(c[0].act, c[2].act, 0) {
+		t.Fatalf("want re-create of the same activity, got %+v", c[2])
 	}
 }
 
@@ -513,6 +718,7 @@ func TestClearDeletesSynchronously(t *testing.T) {
 		h := newHarness(t)
 		h.play("A", 0)
 		h.tick()
+		h.us.update("alice", func(u *store.User) { u.Paused = true })
 		if err := h.e.Clear(ctx, "alice"); err != nil {
 			t.Fatal(err)
 		}
@@ -550,6 +756,7 @@ func TestClearDeletesSynchronously(t *testing.T) {
 		h := newHarness(t)
 		h.play("A", 0)
 		h.tick()
+		h.us.update("alice", func(u *store.User) { u.Paused = true })
 		h.pub.delErrs = []error{&discord.RateLimitError{RetryAfter: 2 * time.Second}}
 		var rl *discord.RateLimitError
 		if err := h.e.Clear(ctx, "alice"); !errors.As(err, &rl) {
