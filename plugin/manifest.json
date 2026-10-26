@@ -1,0 +1,67 @@
+{
+  "$schema": "https://raw.githubusercontent.com/navidrome/navidrome/refs/heads/master/plugins/manifest-schema.json",
+  "name": "nd-simple-rpc",
+  "author": "laforcem",
+  "version": "0.1.0",
+  "description": "Forwards Navidrome playback events to the nd-simple-rpc companion service for Discord Rich Presence",
+  "website": "https://github.com/laforcem/nd-simple-rpc",
+  "permissions": {
+    "users": {
+      "reason": "To process playback for users"
+    },
+    "subsonicapi": {
+      "reason": "To fetch the full track title and album ID"
+    },
+    "artwork": {
+      "reason": "To get a signed album cover URL"
+    },
+    "http": {
+      "reason": "To forward playback events to the companion service",
+      "requiredHosts": [
+        "nd-simple-rpc",
+        "nd-simple-rpc.*",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16"
+      ]
+    }
+  },
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "companionUrl": {
+          "type": "string",
+          "title": "Companion URL",
+          "description": "Base URL of the nd-simple-rpc companion service's internal endpoint",
+          "default": "http://nd-simple-rpc:8081"
+        },
+        "sharedSecret": {
+          "type": "string",
+          "title": "Shared secret",
+          "description": "Bearer token shared with the companion service"
+        }
+      },
+      "required": [
+        "companionUrl",
+        "sharedSecret"
+      ]
+    },
+    "uiSchema": {
+      "type": "VerticalLayout",
+      "elements": [
+        {
+          "type": "Control",
+          "scope": "#/properties/companionUrl"
+        },
+        {
+          "type": "Control",
+          "scope": "#/properties/sharedSecret",
+          "options": {
+            "format": "password"
+          }
+        }
+      ]
+    }
+  }
+}
