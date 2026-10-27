@@ -18,7 +18,7 @@ func TestPlaybackDecodesContractFixture(t *testing.T) {
 	want := Playback{
 		Username: "alice", State: "playing", PositionMs: 30000, PlaybackRate: 1, Timestamp: 1000,
 		Track:    Track{ID: "tr-123", Title: "Waterfall (instrumental mix)", Artist: "Some Artist feat. Guest", Album: "Cascade", DurationMs: 180000},
-		CoverURL: "https://navidrome.example/rest/getCoverArt?id=al-1&size=512&t=tok",
+		CoverURL: "https://navidrome.example/rest/getCoverArt?id=mf-tr-123&size=512&t=tok",
 	}
 	if p != want {
 		t.Fatalf("got %+v, want %+v", p, want)

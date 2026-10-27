@@ -11,5 +11,5 @@
     "album": "Cascade",
     "durationMs": 180000
   },
-  "coverUrl": "https://navidrome.example/rest/getCoverArt?id=al-1&size=512&t=tok"
+  "coverUrl": "https://navidrome.example/rest/getCoverArt?id=mf-tr-123&size=512&t=tok"
 }

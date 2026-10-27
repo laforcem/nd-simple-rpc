@@ -2,13 +2,13 @@
 
 Shows what each user on a [Navidrome](https://www.navidrome.org) server is playing as a Discord "Listening to..." status. It posts from the server, so it works whether or not the user is at a computer or has Discord open.
 
-Pause, stop and expiry clear the status. Cover art is the library's own. Each user connects, pauses and disconnects their own Discord account from a web page.
+Pause, stop and expiry clear the status. Cover art is the track's own, falling back to the album's. Each user connects, pauses and disconnects their own Discord account from a web page.
 
 ## How it works
 
 Two parts, shipped in one container image:
 
-- **Plugin** (`nd-simple-rpc.ndp`, WASM, runs inside Navidrome). Receives playback reports, looks up the full title (subtitle included) and a signed cover URL, and forwards them to the companion. It holds no state and no Discord knowledge. Built from `plugin/` with Go's `wasip1` target (TinyGo is used instead if installed).
+- **Plugin** (`nd-simple-rpc.ndp`, WASM, runs inside Navidrome). Receives playback reports, looks up the full title (subtitle included) and a signed cover URL (track art, else album art), and forwards them to the companion. It holds no state and no Discord knowledge. Built from `plugin/` with Go's `wasip1` target (TinyGo is used instead if installed).
 - **Companion** (`nd-simple-rpc`, Go). Owns the sign-in and connect pages, the OAuth tokens (encrypted in SQLite), and the Discord calls. Its public port serves the web pages; its internal port takes plugin events and must not be exposed.
 
 It uses a real OAuth grant against Discord's headless-session API, not user tokens.

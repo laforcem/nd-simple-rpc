@@ -35,6 +35,7 @@ type Event struct {
 // Host is the set of Navidrome host lookups BuildEvent needs.
 type Host interface {
 	GetSong(username, id string) (title, albumID string, err error)
+	TrackArtURL(trackID string, size int32) (string, error)
 	AlbumArtURL(albumID string, size int32) (string, error)
 }
 
@@ -64,6 +65,12 @@ func BuildEvent(req scrobbler.PlaybackReportRequest, h Host) Event {
 		return ev
 	}
 	ev.Track.Title = title
+	// Navidrome serves the track's own art and falls back to the album's
+	// when the track has none, so per-track covers work out of the box.
+	if cover, err := h.TrackArtURL(req.Track.ID, coverSize); err == nil {
+		ev.CoverURL = cover
+		return ev
+	}
 	if albumID == "" {
 		return ev
 	}
@@ -107,6 +114,10 @@ func (navidromeHost) GetSong(username, id string) (string, string, error) {
 		return "", "", err
 	}
 	return parseSong(body)
+}
+
+func (navidromeHost) TrackArtURL(trackID string, size int32) (string, error) {
+	return host.ArtworkGetTrackUrl(trackID, size)
 }
 
 func (navidromeHost) AlbumArtURL(albumID string, size int32) (string, error) {

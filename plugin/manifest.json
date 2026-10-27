@@ -13,7 +13,7 @@
       "reason": "To fetch the full track title and album ID"
     },
     "artwork": {
-      "reason": "To get a signed album cover URL"
+      "reason": "To get a signed track or album cover URL"
     },
     "http": {
       "reason": "To forward playback events to the companion service",
